@@ -1,0 +1,308 @@
+From 91b113d74009a46f934cb60e0720d72c57e57de7 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Tue, 13 Apr 2021 13:33:52 -0700
+Subject: [PATCH 1/2] rseq: Optimise rseq_get_rseq_cs() and clear_rseq_cs()
+
+Commit ec9c82e03a74 ("rseq: uapi: Declare rseq_cs field as union,
+update includes") added regressions for our servers.
+
+Using copy_from_user() and clear_user() for 64bit values
+is suboptimal.
+
+We can use faster put_user() and get_user() on 64bit arches.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Link: https://lkml.kernel.org/r/20210413203352.71350-4-eric.dumazet@gmail.com
+---
+ kernel/rseq.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/kernel/rseq.c b/kernel/rseq.c
+index a4f86a9d6937cd..d6277b4f616093 100644
+--- a/kernel/rseq.c
++++ b/kernel/rseq.c
+@@ -120,8 +120,13 @@ static int rseq_get_rseq_cs(struct task_struct *t, struct rseq_cs *rseq_cs)
+ 	u32 sig;
+ 	int ret;
+ 
++#ifdef CONFIG_64BIT
++	if (get_user(ptr, &t->rseq->rseq_cs.ptr64))
++		return -EFAULT;
++#else
+ 	if (copy_from_user(&ptr, &t->rseq->rseq_cs.ptr64, sizeof(ptr)))
+ 		return -EFAULT;
++#endif
+ 	if (!ptr) {
+ 		memset(rseq_cs, 0, sizeof(*rseq_cs));
+ 		return 0;
+@@ -204,9 +209,13 @@ static int clear_rseq_cs(struct task_struct *t)
+ 	 *
+ 	 * Set rseq_cs to NULL.
+ 	 */
++#ifdef CONFIG_64BIT
++	return put_user(0UL, &t->rseq->rseq_cs.ptr64);
++#else
+ 	if (clear_user(&t->rseq->rseq_cs.ptr64, sizeof(t->rseq->rseq_cs.ptr64)))
+ 		return -EFAULT;
+ 	return 0;
++#endif
+ }
+ 
+ /*
+
+From 77ba74f51ff5dcd83dd217393527bd42f19940d9 Mon Sep 17 00:00:00 2001
+From: Changheun Lee <nanich.lee@samsung.com>
+Date: Mon, 3 May 2021 18:52:03 +0900
+Subject: [PATCH 2/2] bio: limit bio max size
+
+bio size can grow up to 4GB when muli-page bvec is enabled.
+but sometimes it would lead to inefficient behaviors.
+in case of large chunk direct I/O, - 32MB chunk read in user space -
+all pages for 32MB would be merged to a bio structure if the pages
+physical addresses are contiguous. it makes some delay to submit
+until merge complete. bio max size should be limited to a proper size.
+
+When 32MB chunk read with direct I/O option is coming from userspace,
+kernel behavior is below now in do_direct_IO() loop. it's timeline.
+
+ | bio merge for 32MB. total 8,192 pages are merged.
+ | total elapsed time is over 2ms.
+ |------------------ ... ----------------------->|
+                                                 | 8,192 pages merged a bio.
+                                                 | at this time, first bio submit is done.
+                                                 | 1 bio is split to 32 read request and issue.
+                                                 |--------------->
+                                                  |--------------->
+                                                   |--------------->
+                                                              ......
+                                                                   |--------------->
+                                                                    |--------------->|
+                          total 19ms elapsed to complete 32MB read done from device. |
+
+If bio max size is limited with 1MB, behavior is changed below.
+
+ | bio merge for 1MB. 256 pages are merged for each bio.
+ | total 32 bio will be made.
+ | total elapsed time is over 2ms. it's same.
+ | but, first bio submit timing is fast. about 100us.
+ |--->|--->|--->|---> ... -->|--->|--->|--->|--->|
+      | 256 pages merged a bio.
+      | at this time, first bio submit is done.
+      | and 1 read request is issued for 1 bio.
+      |--------------->
+           |--------------->
+                |--------------->
+                                      ......
+                                                 |--------------->
+                                                  |--------------->|
+        total 17ms elapsed to complete 32MB read done from device. |
+
+As a result, read request issue timing is faster if bio max size is limited.
+Current kernel behavior with multipage bvec, super large bio can be created.
+And it lead to delay first I/O request issue.
+
+Signed-off-by: Changheun Lee <nanich.lee@samsung.com>
+Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+Link: https://lore.kernel.org/r/20210503095203.29076-1-nanich.lee@samsung.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/bio.c            | 13 +++++++++++--
+ block/blk-settings.c   |  5 +++++
+ include/linux/bio.h    |  4 +++-
+ include/linux/blkdev.h |  2 ++
+ 4 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/block/bio.c b/block/bio.c
+index 50e579088aca4c..48657739f59b2a 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -255,6 +255,13 @@ void bio_init(struct bio *bio, struct bio_vec *table,
+ }
+ EXPORT_SYMBOL(bio_init);
+ 
++unsigned int bio_max_size(struct bio *bio)
++{
++	struct block_device *bdev = bio->bi_bdev;
++
++	return bdev ? bdev->bd_disk->queue->limits.bio_max_bytes : UINT_MAX;
++}
++
+ /**
+  * bio_reset - reinitialize a bio
+  * @bio:	bio to reset
+@@ -866,7 +873,7 @@ bool __bio_try_merge_page(struct bio *bio, struct page *page,
+ 		struct bio_vec *bv = &bio->bi_io_vec[bio->bi_vcnt - 1];
+ 
+ 		if (page_is_mergeable(bv, page, len, off, same_page)) {
+-			if (bio->bi_iter.bi_size > UINT_MAX - len) {
++			if (bio->bi_iter.bi_size > bio_max_size(bio) - len) {
+ 				*same_page = false;
+ 				return false;
+ 			}
+@@ -995,6 +1002,7 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
+ {
+ 	unsigned short nr_pages = bio->bi_max_vecs - bio->bi_vcnt;
+ 	unsigned short entries_left = bio->bi_max_vecs - bio->bi_vcnt;
++	unsigned int bytes_left = bio_max_size(bio) - bio->bi_iter.bi_size;
+ 	struct bio_vec *bv = bio->bi_io_vec + bio->bi_vcnt;
+ 	struct page **pages = (struct page **)bv;
+ 	bool same_page = false;
+@@ -1010,7 +1018,8 @@ static int __bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter)
+ 	BUILD_BUG_ON(PAGE_PTRS_PER_BVEC < 2);
+ 	pages += entries_left * (PAGE_PTRS_PER_BVEC - 1);
+ 
+-	size = iov_iter_get_pages(iter, pages, LONG_MAX, nr_pages, &offset);
++	size = iov_iter_get_pages(iter, pages, bytes_left, nr_pages,
++				  &offset);
+ 	if (unlikely(size <= 0))
+ 		return size ? size : -EFAULT;
+ 
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index b4aa2f37fab6f5..cd3dcb5afe50ab 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -37,6 +37,7 @@ EXPORT_SYMBOL_GPL(blk_queue_rq_timeout);
+  */
+ void blk_set_default_limits(struct queue_limits *lim)
+ {
++	lim->bio_max_bytes = UINT_MAX;
+ 	lim->max_segments = BLK_MAX_SEGMENTS;
+ 	lim->max_discard_segments = 1;
+ 	lim->max_integrity_segments = 0;
+@@ -168,6 +169,10 @@ void blk_queue_max_hw_sectors(struct request_queue *q, unsigned int max_hw_secto
+ 				 limits->logical_block_size >> SECTOR_SHIFT);
+ 	limits->max_sectors = max_sectors;
+ 
++	if (check_shl_overflow(max_sectors, SECTOR_SHIFT,
++				&limits->bio_max_bytes))
++		limits->bio_max_bytes = UINT_MAX;
++
+ 	q->backing_dev_info->io_pages = max_sectors >> (PAGE_SHIFT - 9);
+ }
+ EXPORT_SYMBOL(blk_queue_max_hw_sectors);
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index d0246c92a6e865..e5add63da3af9d 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -106,6 +106,8 @@ static inline void *bio_data(struct bio *bio)
+ 	return NULL;
+ }
+ 
++extern unsigned int bio_max_size(struct bio *bio);
++
+ /**
+  * bio_full - check if the bio is full
+  * @bio:	bio to check
+@@ -119,7 +121,7 @@ static inline bool bio_full(struct bio *bio, unsigned len)
+ 	if (bio->bi_vcnt >= bio->bi_max_vecs)
+ 		return true;
+ 
+-	if (bio->bi_iter.bi_size > UINT_MAX - len)
++	if (bio->bi_iter.bi_size > bio_max_size(bio) - len)
+ 		return true;
+ 
+ 	return false;
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 158aefae1030db..c205d60ac61105 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -312,6 +312,8 @@ enum blk_zoned_model {
+ };
+ 
+ struct queue_limits {
++	unsigned int		bio_max_bytes;
++
+ 	unsigned long		bounce_pfn;
+ 	unsigned long		seg_boundary_mask;
+ 	unsigned long		virt_boundary_mask;
+From ba65d9e770078c90a022a2ff3e1cb9a09eac4413 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Tue, 13 Apr 2021 13:33:51 -0700
+Subject: [PATCH] rseq: Remove redundant access_ok()
+
+After commit 8f2817701492 ("rseq: Use get_user/put_user rather
+than __get_user/__put_user") we no longer need
+an access_ok() call from __rseq_handle_notify_resume()
+
+Mathieu pointed out the same cleanup can be done
+in rseq_syscall().
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Link: https://lkml.kernel.org/r/20210413203352.71350-3-eric.dumazet@gmail.com
+---
+ kernel/rseq.c | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/kernel/rseq.c b/kernel/rseq.c
+index f020f18f512a3f..cfe01ab5253c1c 100644
+--- a/kernel/rseq.c
++++ b/kernel/rseq.c
+@@ -273,8 +273,6 @@ void __rseq_handle_notify_resume(struct ksignal *ksig, struct pt_regs *regs)
+ 
+ 	if (unlikely(t->flags & PF_EXITING))
+ 		return;
+-	if (unlikely(!access_ok(t->rseq, sizeof(*t->rseq))))
+-		goto error;
+ 	ret = rseq_ip_fixup(regs);
+ 	if (unlikely(ret < 0))
+ 		goto error;
+@@ -301,8 +299,7 @@ void rseq_syscall(struct pt_regs *regs)
+ 
+ 	if (!t->rseq)
+ 		return;
+-	if (!access_ok(t->rseq, sizeof(*t->rseq)) ||
+-	    rseq_get_rseq_cs(t, &rseq_cs) || in_rseq_cs(ip, &rseq_cs))
++	if (rseq_get_rseq_cs(t, &rseq_cs) || in_rseq_cs(ip, &rseq_cs))
+ 		force_sig(SIGSEGV);
+ }
+From 34a526e850dbee1c54338f3233cba5f8324bbb6b Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Tue, 13 Apr 2021 13:33:50 -0700
+Subject: [PATCH] rseq: Optimize rseq_update_cpu_id()
+
+Two put_user() in rseq_update_cpu_id() are replaced
+by a pair of unsafe_put_user() with appropriate surroundings.
+
+This removes one stac/clac pair on x86 in fast path.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Link: https://lkml.kernel.org/r/20210413203352.71350-2-eric.dumazet@gmail.com
+---
+ kernel/rseq.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/rseq.c b/kernel/rseq.c
+index a4f86a9d6937cd..f020f18f512a3f 100644
+--- a/kernel/rseq.c
++++ b/kernel/rseq.c
+@@ -84,13 +84,20 @@
+ static int rseq_update_cpu_id(struct task_struct *t)
+ {
+ 	u32 cpu_id = raw_smp_processor_id();
++	struct rseq __user *rseq = t->rseq;
+ 
+-	if (put_user(cpu_id, &t->rseq->cpu_id_start))
+-		return -EFAULT;
+-	if (put_user(cpu_id, &t->rseq->cpu_id))
+-		return -EFAULT;
++	if (!user_write_access_begin(rseq, sizeof(*rseq)))
++		goto efault;
++	unsafe_put_user(cpu_id, &rseq->cpu_id_start, efault_end);
++	unsafe_put_user(cpu_id, &rseq->cpu_id, efault_end);
++	user_write_access_end();
+ 	trace_rseq_update(t);
+ 	return 0;
++
++efault_end:
++	user_write_access_end();
++efault:
++	return -EFAULT;
+ }
+ 
+ static int rseq_reset_rseq_cpu_id(struct task_struct *t)
