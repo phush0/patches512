@@ -1,0 +1,44 @@
+From d3311e8ee7dc68cb88ae7899b58b1eca799ea1ef Mon Sep 17 00:00:00 2001
+From: Jisheng Zhang <>
+Date: Thu, 24 Jun 2021 16:32:18 +0800
+Subject: [PATCH] timer: Use static_branch_likely() for timers_nohz_active
+
+The static key timers_nohz_active is likely to be true, so use
+static_branch_likely() to reflect this fact.
+
+Per include/linux/jump_label.h:
+
+ * type\branch|	likely (1)	      |	unlikely (0)
+ * -----------+-----------------------+------------------
+ *            |                       |
+ *  true (1)  |	   ...		      |	   ...
+ *            |    NOP		      |	   JMP L
+ *            |    <br-stmts>	      |	1: ...
+ *            |	L: ...		      |
+ *            |			      |
+ *            |			      |	L: <br-stmts>
+ *            |			      |	   jmp 1b
+ *            |                       |
+ * -----------+-----------------------+------------------
+
+This could improve the finally generated code a bit for the most likely
+scenario, I.E save two "jmp" instructions.
+
+Signed-off-by: Jisheng Zhang <Jisheng.Zhang@synaptics.com>
+---
+ kernel/time/timer.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/time/timer.c b/kernel/time/timer.c
+index f475f1a027c8b3..eabc44d5d19930 100644
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -265,7 +265,7 @@ int timer_migration_handler(struct ctl_table *table, int write,
+ 
+ static inline bool is_timers_nohz_active(void)
+ {
+-	return static_branch_unlikely(&timers_nohz_active);
++	return static_branch_likely(&timers_nohz_active);
+ }
+ #else
+ static inline bool is_timers_nohz_active(void) { return false; }
